@@ -16,11 +16,14 @@
 #include "gummetalhash.h"
 #include "gumspinlock.h"
 #include "gumtls.h"
+#include "gum-init.h"
+#include "guminterceptor.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <unwind.h>
 
 #define GUM_CODE_SLAB_SIZE_INITIAL  (128 * 1024)
 #define GUM_CODE_SLAB_SIZE_DYNAMIC  (4 * 1024 * 1024)
@@ -67,6 +70,10 @@ typedef struct _GumBranchTarget GumBranchTarget;
 
 typedef guint GumVirtualizationRequirements;
 
+typedef struct _Unwind_Exception _Unwind_Exception;
+typedef struct _Unwind_Context _Unwind_Context;
+struct dwarf_eh_bases;
+
 struct _GumStalker
 {
   GObject parent;
@@ -108,6 +115,7 @@ struct _GumStalker
   GHashTable * probe_array_by_address;
 
   GumExceptor * exceptor;
+  GumInterceptor * interceptor;
 };
 
 struct _GumInfectContext
@@ -195,6 +203,8 @@ struct _GumExecCtx
   gpointer last_stack_push;
   gpointer last_stack_pop_and_go;
   gpointer last_invalidator;
+
+  GumMetalHashTable * excluded_calls;
 };
 
 enum _GumExecCtxState
@@ -321,6 +331,23 @@ enum _GumVirtualizationRequirements
   GUM_REQUIRE_RELOCATION       = 1 << 0,
   GUM_REQUIRE_EXCLUSIVE_STORE  = 1 << 1,
 };
+
+
+extern _Unwind_Reason_Code __gxx_personality_v0 (int version,
+    _Unwind_Action actions, uint64_t exception_class,
+    _Unwind_Exception * unwind_exception, _Unwind_Context * context)
+    __attribute__ ((weak));
+extern const void * _Unwind_Find_FDE (const void * pc, struct dwarf_eh_bases *);
+extern unsigned long _Unwind_GetIP (struct _Unwind_Context *);
+
+static void gum_stalker_ensure_unwind_apis_instrumented (GumStalker* self);
+static void gum_stalker_deinit_unwind_apis_instrumentation (GumStalker* self);
+static _Unwind_Reason_Code gum_stalker_exception_personality (int version,
+    _Unwind_Action actions, uint64_t exception_class,
+    _Unwind_Exception * unwind_exception, _Unwind_Context * context);
+static const void * gum_stalker_exception_find_fde (const void * pc,
+    struct dwarf_eh_bases * bases);
+static unsigned long gum_stalker_exception_getip (struct _Unwind_Context* context);
 
 static void gum_stalker_dispose (GObject * object);
 static void gum_stalker_finalize (GObject * object);
@@ -635,6 +662,218 @@ gum_stalker_init (GumStalker * self)
 
   self->exceptor = gum_exceptor_obtain ();
   gum_exceptor_add (self->exceptor, gum_stalker_on_exception, self);
+
+  gum_stalker_ensure_unwind_apis_instrumented (self);
+}
+
+
+static void
+gum_stalker_ensure_unwind_apis_instrumented (GumStalker* self)
+{
+  static gsize initialized = FALSE;
+
+  if (__gxx_personality_v0 == NULL)
+    return;
+
+  if (g_once_init_enter (&initialized))
+  {
+    GumReplaceReturn attach_ret;
+
+    self->interceptor = gum_interceptor_obtain ();
+
+    attach_ret = gum_interceptor_replace (self->interceptor,
+        __gxx_personality_v0, gum_stalker_exception_personality, self);
+    if (attach_ret != GUM_ATTACH_OK &&
+        attach_ret != GUM_ATTACH_ALREADY_ATTACHED)
+    {
+      g_error ("Failed to attach to __gxx_personality_v0: %d", attach_ret);
+    }
+
+    attach_ret = gum_interceptor_replace (self->interceptor,
+        _Unwind_Find_FDE, gum_stalker_exception_find_fde, self);
+    if (attach_ret != GUM_ATTACH_OK &&
+        attach_ret != GUM_ATTACH_ALREADY_ATTACHED)
+    {
+      g_error ("Failed to attach to _Unwind_Find_FDE: %d", attach_ret);
+    }
+
+    attach_ret = gum_interceptor_replace (self->interceptor,
+        _Unwind_GetIP, gum_stalker_exception_getip, self);
+    if (attach_ret != GUM_ATTACH_OK &&
+        attach_ret != GUM_ATTACH_ALREADY_ATTACHED)
+    {
+      g_error ("Failed to attach to _Unwind_GetIP: %d", attach_ret);
+    }
+
+    /*_gum_register_early_destructor (*/
+        /*gum_stalker_deinit_unwind_apis_instrumentation);*/
+
+    g_once_init_leave (&initialized, TRUE);
+  }
+}
+
+static void
+gum_stalker_deinit_unwind_apis_instrumentation (GumStalker* self)
+{
+  gum_interceptor_revert (self->interceptor, __gxx_personality_v0);
+  gum_interceptor_revert (self->interceptor, _Unwind_Find_FDE);
+  gum_interceptor_revert (self->interceptor, _Unwind_GetIP);
+  g_clear_object (&self->interceptor);
+}
+
+static _Unwind_Reason_Code
+gum_stalker_exception_personality (int version,
+                                   _Unwind_Action actions,
+                                   uint64_t exception_class,
+                                   _Unwind_Exception * unwind_exception,
+                                   _Unwind_Context * context)
+{
+  _Unwind_Reason_Code reason;
+  GumExecCtx * ctx;
+  gpointer throw_ip;
+  gpointer real_throw_ip;
+
+  /*
+   * This function is responsible for the dispatching of exceptions. It is
+   * actually called twice, first during the search phase and then subsequently
+   * for the cleanup phase. This personality function is provided with a context
+   * containing the PC of the exception. In this case, the PC is the address of
+   * the instruction immediately after the exception is thrown (collected by
+   * libunwind from the callstack). If this is a code address rather than a real
+   * address, we will perform some address translation, otherwise we will let
+   * the function proceed as normal.
+   *
+   * We must set the PC to the real address, before we call the original
+   * personality function. But we must also modify the PC in the event that the
+   * personality function installs a new context. This happens, for example,
+   * when the exception dispatcher needs to modify the PC to execute any
+   * relevant catch blocks. In this case, we must obtain the instrumented block
+   * for the real address we are going to vector to and restore the PC to the
+   * instrumented version of the block. Otherwise, we will find that the
+   * exception is correctly handled, but afterwards execution continues from the
+   * real address and hence the thread is no longer under the control of
+   * Stalker.
+   */
+
+  ctx = gum_stalker_get_exec_ctx (GUM_IC_GET_REPLACEMENT_DATA (gum_interceptor_get_current_invocation (), GumStalker *));
+  if (ctx == NULL)
+  {
+    return __gxx_personality_v0 (version, actions, exception_class,
+        unwind_exception, context);
+  }
+
+  throw_ip = GSIZE_TO_POINTER (_Unwind_GetIP (context));
+
+  real_throw_ip = gum_metal_hash_table_lookup (ctx->excluded_calls, throw_ip);
+  if (real_throw_ip == NULL)
+  {
+    return __gxx_personality_v0 (version, actions, exception_class,
+        unwind_exception, context);
+  }
+
+  _Unwind_SetIP (context, GPOINTER_TO_SIZE (real_throw_ip));
+
+  reason = __gxx_personality_v0 (version, actions, exception_class,
+      unwind_exception, context);
+  if (reason == _URC_INSTALL_CONTEXT)
+  {
+    gpointer real_resume_ip, resume_ip;
+
+    real_resume_ip = GSIZE_TO_POINTER (_Unwind_GetIP (context));
+
+    resume_ip = gum_exec_ctx_switch_block (ctx, real_resume_ip);
+    _Unwind_SetIP (context, GPOINTER_TO_SIZE (resume_ip));
+
+    ctx->pending_calls--;
+  }
+
+  return reason;
+}
+
+static const void *
+gum_stalker_exception_find_fde (const void * pc,
+                                struct dwarf_eh_bases * bases)
+{
+  const void * result;
+  GumExecCtx * ctx;
+  gpointer real_address;
+
+  /*
+   * This function is responsible for finding the Frame Descriptor Entry
+   * associated with a given exception. To do this, it is provided with the PC
+   * of the entry to find.
+   *
+   * The PC provided is the address of the last byte of the instruction which
+   * called __cxa_throw. Since we store the address of the next instruction in
+   * our hashtable, (this is used by the personality function) we need to add 1
+   * to the value provided before we perform the lookup and subsequently
+   * subtract one from the value retrieved.
+   *
+   * If an exception is thrown whilst there is a code (rather than real) address
+   * in our stack (to allow us to execute excluded ranges), then the translation
+   * from code address to real address should have been inserted into the
+   * hashtable when the instrumented code was written. The _Unwind_Find_FDE
+   * function will be called with a code address (rather than the real address)
+   * which would usually fail, when this happends we need to translate the
+   * address before the call. If we have no associated entry in our lookup, then
+   * we can let the call proceed as normal.
+   */
+
+  ctx = gum_stalker_get_exec_ctx (GUM_IC_GET_REPLACEMENT_DATA (gum_interceptor_get_current_invocation (), GumStalker *));
+  if (ctx == NULL)
+    return _Unwind_Find_FDE (pc, bases);
+
+  real_address = gum_metal_hash_table_lookup (ctx->excluded_calls, pc + 1);
+  if (real_address == NULL)
+  {
+    real_address = gum_invocation_stack_translate (gum_interceptor_get_current_stack(),
+        (gpointer) pc + 1);
+    if (real_address == NULL)
+    {
+      real_address = gum_metal_hash_table_lookup (ctx->mappings, pc + 1);
+      if (real_address == NULL)
+      {
+        return _Unwind_Find_FDE (pc, bases);
+      }
+    }
+  }
+
+  result = _Unwind_Find_FDE (real_address - 1, bases);
+  return result;
+}
+
+static unsigned long
+gum_stalker_exception_getip (struct _Unwind_Context * context)
+{
+  unsigned long ip;
+  unsigned long result;
+  GumExecCtx * ctx;
+  gpointer real_address;
+
+  ctx = gum_stalker_get_exec_ctx (GUM_IC_GET_REPLACEMENT_DATA (
+        gum_interceptor_get_current_invocation (), GumStalker *));
+  if (ctx == NULL)
+    return _Unwind_GetIP (context);
+
+  ip = _Unwind_GetIP (context);
+
+  real_address = gum_metal_hash_table_lookup (ctx->excluded_calls, (gconstpointer) ip);
+  if (real_address == NULL)
+  {
+    real_address = gum_invocation_stack_translate (gum_interceptor_get_current_stack(),
+        (gpointer) ip);
+    if (real_address == NULL)
+    {
+      real_address = gum_metal_hash_table_lookup (ctx->mappings, (gconstpointer) ip);
+      if (real_address == NULL)
+      {
+        return ip;
+      }
+    }
+  }
+
+  result = (unsigned long) real_address;
+  return result;
 }
 
 static void
@@ -1567,6 +1806,7 @@ gum_exec_ctx_new (GumStalker * stalker,
 
   code_slab->invalidator = ctx->last_invalidator;
 
+  ctx->excluded_calls = gum_metal_hash_table_new (NULL, NULL);
   return ctx;
 }
 
@@ -1648,6 +1888,8 @@ gum_exec_ctx_dispose (GumExecCtx * ctx)
       gum_exec_block_clear (block);
     }
   }
+
+  gum_metal_hash_table_unref (ctx->excluded_calls);
 }
 
 static GumCodeSlab *
@@ -3689,6 +3931,9 @@ gum_exec_block_virtualize_branch_insn (GumExecBlock * block,
 
         gum_arm64_relocator_write_one (gc->relocator);
 
+        gum_metal_hash_table_insert (ctx->excluded_calls,
+            GSIZE_TO_POINTER (insn->end), cw->code);
+
         gum_exec_block_open_prolog (block, GUM_PROLOG_MINIMAL, gc);
         gum_arm64_writer_put_call_address_with_arguments (cw,
             GUM_ADDRESS (gum_exec_ctx_end_call), 1,
@@ -4077,6 +4322,8 @@ gum_exec_block_write_call_invoke_code (GumExecBlock * block,
       gum_arm64_writer_put_blr_reg_no_auth (cw, target->reg);
     else
       gum_arm64_writer_put_blr_reg (cw, target->reg);
+
+    gum_metal_hash_table_insert (ctx->excluded_calls, gc->instruction->end, cw->code);
 
     gum_exec_block_open_prolog (block, GUM_PROLOG_MINIMAL, gc);
     gum_arm64_writer_put_call_address_with_arguments (cw,
