@@ -199,6 +199,8 @@ typedef enum {
   GUM_ELF_DYNAMIC_HIPROC = 0x7fffffff,
 } GumElfDynamicTag;
 
+#define GUM_ELF_SECTION_HEADER_INDEX_NONE 0
+
 typedef struct _GumElfDependencyDetails GumElfDependencyDetails;
 typedef struct _GumElfSymbolDetails GumElfSymbolDetails;
 typedef struct _GumElfDynamicEntryDetails GumElfDynamicEntryDetails;
@@ -262,6 +264,7 @@ GUM_API GumAddress gum_elf_module_get_base_address (GumElfModule * self);
 GUM_API GumAddress gum_elf_module_get_preferred_address (GumElfModule * self);
 GUM_API GumAddress gum_elf_module_get_entrypoint (GumElfModule * self);
 GUM_API gpointer gum_elf_module_get_elf (GumElfModule * self);
+GUM_API gconstpointer gum_elf_module_get_file_data (GumElfModule * self);
 GUM_API gboolean gum_elf_module_has_interp (GumElfModule * self);
 
 GUM_API void gum_elf_module_enumerate_dependencies (GumElfModule * self,
