@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2010-2021 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2010-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2015 Marc Hartmayer <hello@hartmayer.com>
  * Copyright (C) 2020-2021 Francesco Tamagni <mrmacete@protonmail.ch>
  * Copyright (C) 2020 Marcus Mengs <mame8282@googlemail.com>
@@ -779,7 +779,7 @@ TESTCASE (instruction_can_be_parsed)
   EXPECT_SEND_MESSAGE_WITH ("\"x0\"");
   EXPECT_SEND_MESSAGE_WITH ("\"w\"");
   EXPECT_SEND_MESSAGE_WITH ("\"imm\"");
-  EXPECT_SEND_MESSAGE_WITH ("\"r\"");
+  EXPECT_SEND_MESSAGE_WITH ("\"w\"");
   EXPECT_SEND_MESSAGE_WITH ("42");
 
   EXPECT_SEND_MESSAGE_WITH ("\"str\"");
@@ -3534,11 +3534,9 @@ TESTCASE (execution_can_be_traced_after_native_function_call_from_hook)
       "    call: true,"
       "  },"
       "  onCallSummary(summary) {"
-      "    for (const target of [targetFuncInt, targetFuncNestedA]) {"
-      "      const key = target.strip().toString();"
-      "      send(key in summary);"
-      "      send(summary[key]);"
-      "    }"
+      "    const key = targetFuncNestedA.strip().toString();"
+      "    send(key in summary);"
+      "    send(summary[key]);"
       "  }"
       "});"
 
@@ -3561,8 +3559,6 @@ TESTCASE (execution_can_be_traced_after_native_function_call_from_hook)
   sdc_await_run_confirmation (&channel);
 
   POST_MESSAGE ("{\"type\":\"stop\"}");
-  EXPECT_SEND_MESSAGE_WITH ("true");
-  EXPECT_SEND_MESSAGE_WITH ("1");
   EXPECT_SEND_MESSAGE_WITH ("true");
   EXPECT_SEND_MESSAGE_WITH ("2");
   EXPECT_NO_MESSAGES ();
@@ -4748,12 +4744,15 @@ TESTCASE (rpc_can_be_performed)
       "rpc.exports.badger = () => {"
           "const buf = Memory.allocUtf8String(\"Yo\");"
           "return buf.readByteArray(2);"
+      "};"
+      "rpc.exports.returnNull = () => {"
+          "return null;"
       "};");
   EXPECT_NO_MESSAGES ();
 
   POST_MESSAGE ("[\"frida:rpc\",1,\"list\"]");
   EXPECT_SEND_MESSAGE_WITH ("[\"frida:rpc\",1,\"ok\","
-      "[\"foo\",\"bar\",\"badger\"]]");
+      "[\"foo\",\"bar\",\"badger\",\"returnNull\"]]");
 
   POST_MESSAGE ("[\"frida:rpc\",2,\"call\",\"foo\",[1,2]]");
   EXPECT_SEND_MESSAGE_WITH ("[\"frida:rpc\",2,\"ok\",3]");
@@ -4774,6 +4773,9 @@ TESTCASE (rpc_can_be_performed)
   POST_MESSAGE ("[\"frida:rpc\",7,\"call\",\"badger\",[]]");
   EXPECT_SEND_MESSAGE_WITH_PAYLOAD_AND_DATA ("[\"frida:rpc\",7,\"ok\",{}]",
       "59 6f");
+
+  POST_MESSAGE ("[\"frida:rpc\",8,\"call\",\"returnNull\",[]]");
+  EXPECT_SEND_MESSAGE_WITH ("[\"frida:rpc\",8,\"ok\",null]");
 }
 
 TESTCASE (message_can_be_sent)
@@ -9201,6 +9203,10 @@ target_function_string (const gchar * arg)
 
   for (i = 0; i != 10; i++)
     gum_script_dummy_global_to_trick_optimizer += i * arg[0];
+
+  /* Prevent optimizer from assuming what the return value is. */
+  if (gum_script_dummy_global_to_trick_optimizer == 0)
+    return NULL;
 
   return arg;
 }

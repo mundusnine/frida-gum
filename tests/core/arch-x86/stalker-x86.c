@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2021 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2009-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2010-2013 Karl Trygve Kalleberg <karltk@boblycat.org>
  *
  * Licence: wxWindows Library Licence, Version 3.1
@@ -3392,7 +3392,7 @@ GUM_NOINLINE static void
 test_check_followed (void)
 {
   /* Avoid calls being optimized out */
-  asm ("");
+  asm ("nop;");
 }
 
 #endif
